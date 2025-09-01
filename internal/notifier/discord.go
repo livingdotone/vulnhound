@@ -48,7 +48,7 @@ func (n *DiscordNotifier) SendCVE(cve fetcher.CVE) error {
 	cveType := filter.CVEType(cve.Description)
 	channelID, ok := n.Channels[cveType]
 	if !ok {
-		return fmt.Errorf("no channel mapped for CVE type: %s", &cveType)
+		return fmt.Errorf("no channel mapped for CVE type: %s", cveType)
 	}
 
 	_, err := n.Session.ChannelMessageSendEmbed(channelID, &discordgo.MessageEmbed{
