@@ -1,11 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/livingdotone/vulnhound/internal/fetcher"
+	"github.com/livingdotone/vulnhound/internal/filter"
 	"github.com/livingdotone/vulnhound/internal/notifier"
 	"github.com/spf13/viper"
 )
@@ -42,24 +44,74 @@ func main() {
 		log.Fatal("DISCORD_BOT_TOKEN not set")
 	}
 
-	delay := time.Duration(2) * time.Second
-
-	n, err := notifier.New(cfg.DiscordToken, cfg.Channels, delay)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer n.Close()
-
-	cves, err := fetcher.FetchNVDCVEs(fetcher.CVEQuery{
-		PubStart:   "2025-08-25T00:00:00Z",
-		PubEnd:     "2025-09-01T00:00:00Z",
-		MaxResults: 50,
-	})
-	if err != nil {
-		log.Fatal(err)
+	pubStart := time.Now().AddDate(0, 0, -7).Format(time.RFC3339)
+	pubEnd := time.Now().Format(time.RFC3339)
+	maxResults := viper.GetInt("MAX_RESULTS")
+	if maxResults == 0 {
+		maxResults = 50
 	}
 
-	n.SendCVEs(cves)
+	cveQuery := fetcher.CVEQuery{
+		PubStart:   pubStart,
+		PubEnd:     pubEnd,
+		MaxResults: maxResults,
+	}
 
-	fmt.Println("Finished sending CVEs to Discord channels.")
+	cves, err := fetcher.FetchNVDCVEs(cveQuery)
+	if err != nil {
+		log.Fatal("Failed to fetch CVEs:", err)
+	}
+
+	log.Printf("Fetched %d CVEs", len(cves.Vulnerabilities))
+
+	var infos []filter.CveInfo
+	for i, vuln := range cves.Vulnerabilities {
+		if len(vuln.Cve.Descriptions) == 0 {
+			continue
+		}
+
+		desc := vuln.Cve.Descriptions[0].Value
+		score := cves.GetScore(i)
+
+		info := filter.BuildCveInfo(vuln.Cve.ID, desc, score)
+		infos = append(infos, info)
+	}
+
+	if len(infos) == 0 {
+		log.Println("No CVEs to send")
+		return
+	}
+
+	dNotifier, err := notifier.New(cfg.DiscordToken, cfg.Channels, time.Duration(cfg.DelaySeconds))
+	if err != nil {
+		log.Fatal("Failed to init Discord notifier:", err)
+	}
+	defer dNotifier.Stop()
+
+	log.Println("Sending CVEs to Discord...")
+	dNotifier.SendCVEs(infos)
+
+	log.Println("All CVEs sent successfully!")
+}
+
+func initDb() (*sql.DB, error) {
+	dbPath := "../vulnhound.db"
+
+	db, err := sql.Open("sqlite3", dbPath)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to open SQLite DB: %w", err)
+	}
+
+	createTable := `
+	CREATE TABLE IF NOT EXISTS sent_cves (
+		cve_id TEXT PRIMARY KEY,
+		sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+
+	if _, err := db.Exec(createTable); err != nil {
+		return nil, fmt.Errorf("failed to create table: %w", err)
+	}
+
+	return db, nil
 }

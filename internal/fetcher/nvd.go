@@ -52,15 +52,32 @@ type NvdResponse struct {
 	Vulnerabilities []struct {
 		Cve struct {
 			ID           string `json:"id"`
+			SourceID     string `json:"sourceIdentifier"`
+			Published    string `json:"published"`
+			LastModified string `json:"lastModified"`
 			Descriptions []struct {
 				Lang  string `json:"lang"`
 				Value string `json:"value"`
 			} `json:"descriptions"`
+			Metrics struct {
+				CVSSMetricV31 []struct {
+					CvssData struct {
+						BaseScore float64 `json:"baseScore"`
+					} `json:"cvssData"`
+				} `json:"cvssMetricV31"`
+			} `json:"metrics"`
 		} `json:"cve"`
 	} `json:"vulnerabilities"`
 }
 
-func FetchNVDCVEs(query CVEQuery) ([]CVE, error) {
+func (nvd *NvdResponse) GetScore(i int) float64 {
+	if len(nvd.Vulnerabilities[i].Cve.Metrics.CVSSMetricV31) > 0 {
+		return nvd.Vulnerabilities[i].Cve.Metrics.CVSSMetricV31[0].CvssData.BaseScore
+	}
+	return 0.0
+}
+
+func FetchNVDCVEs(query CVEQuery) (*NvdResponse, error) {
 	v := validator.New()
 
 	if err := v.Struct(query); err != nil {
@@ -97,24 +114,5 @@ func FetchNVDCVEs(query CVEQuery) ([]CVE, error) {
 		return nil, fmt.Errorf("error decoding NVD JSON data: %w", err)
 	}
 
-	cves := []CVE{}
-
-	for _, v := range data.Vulnerabilities {
-		desc := ""
-		for _, d := range v.Cve.Descriptions {
-			if d.Lang == "en" {
-				desc = d.Value
-				break
-			}
-		}
-
-		cve := CVE{
-			ID:          v.Cve.ID,
-			Description: desc,
-			URL:         fmt.Sprintf("https://nvd.nist.gov/vuln/detail/%s", v.Cve.ID),
-		}
-		cves = append(cves, cve)
-	}
-
-	return cves, nil
+	return &data, nil
 }

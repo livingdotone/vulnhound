@@ -9,17 +9,21 @@ package notifier
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/livingdotone/vulnhound/internal/fetcher"
 	"github.com/livingdotone/vulnhound/internal/filter"
+	"github.com/spf13/viper"
 )
 
+const batchSize = 5                // quantos CVEs por rodada
+const batchDelay = 3 * time.Second // delay entre rodadas
+
 type DiscordNotifier struct {
-	Session  *discordgo.Session
-	Channels map[string]string // key = CVE type, value = Discord channel ID
-	Delay    time.Duration
+	Session        *discordgo.Session
+	channelByCat   map[string]string
+	defaultChannel string
 }
 
 func New(token string, channels map[string]string, delay time.Duration) (*DiscordNotifier, error) {
@@ -33,10 +37,22 @@ func New(token string, channels map[string]string, delay time.Duration) (*Discor
 		return nil, fmt.Errorf("error opening Discord session: %w", err)
 	}
 
+	channelByCat := map[string]string{
+		"Web/SQLi 🌐":            viper.GetString("DISCORD_CHANNEL_WEB"),
+		"Web/XSS 🌐":             viper.GetString("DISCORD_CHANNEL_WEB"),
+		"Web/CSRF 🌐":            viper.GetString("DISCORD_CHANNEL_WEB"),
+		"Web/Deserialization 🌐": viper.GetString("DISCORD_CHANNEL_WEB"),
+		"Linux 🐧":               viper.GetString("DISCORD_CHANNEL_LINUX"),
+		"Windows 🪟":             viper.GetString("DISCORD_CHANNEL_WINDOWS"),
+		"Mac 🍏":                 viper.GetString("DISCORD_CHANNEL_MAC"),
+		"Mobile/Android 📱":      viper.GetString("DISCORD_CHANNEL_ANDROID"),
+		"Mobile/iOS 📱":          viper.GetString("DISCORD_CHANNEL_IOS"),
+	}
+
 	return &DiscordNotifier{
-		Session:  dg,
-		Channels: channels,
-		Delay:    delay,
+		Session:        dg,
+		channelByCat:   channelByCat,
+		defaultChannel: viper.GetString("DISCORD_CHANNEL_DEFAULT"),
 	}, nil
 }
 
@@ -44,53 +60,73 @@ func (n *DiscordNotifier) Close() {
 	n.Session.Close()
 }
 
-func (n *DiscordNotifier) SendCVE(cve fetcher.CVE) error {
-	cveType := filter.CVEType(cve.Description)
-	channelID, ok := n.Channels[cveType]
-	if !ok {
-		return fmt.Errorf("no channel mapped for CVE type: %s", cveType)
+func (n *DiscordNotifier) SendCVE(cve filter.CveInfo) error {
+	// pick channel by category
+	channelID, ok := n.channelByCat[cve.Category]
+	if !ok || channelID == "" {
+		channelID = n.defaultChannel
+	}
+	if channelID == "" {
+		return fmt.Errorf("no channel configured for category %s", cve.Category)
 	}
 
-	_, err := n.Session.ChannelMessageSendEmbed(channelID, &discordgo.MessageEmbed{
-		Title:       cve.ID,
-		URL:         cve.URL,
+	embed := &discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("%s", cve.ID),
+		URL:         fmt.Sprintf("https://nvd.nist.gov/vuln/detail/%s", cve.ID),
 		Description: cve.Description,
-		Color:       16711680, // red
-	})
-
-	if err != nil {
-		fmt.Errorf("error sending message to Discord: %w", err)
+		Color:       cve.Color,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Severity",
+				Value:  fmt.Sprintf("%s (%.1f)", cve.Severity, cve.Score),
+				Inline: true,
+			},
+			{
+				Name:   "Category",
+				Value:  cve.Category,
+				Inline: true,
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Powered by VulnHound 🐺",
+		},
 	}
 
-	time.Sleep(n.Delay) // prevents flooding
+	_, err := n.Session.ChannelMessageSendEmbed(channelID, embed)
+	if err != nil {
+		log.Printf("❌ Failed to send CVE %s: %v", cve.ID, err)
+		return err
+	}
+
+	log.Printf("✅ Sent %s to channel %s", cve.ID, channelID)
 	return nil
 }
 
-func (n *DiscordNotifier) SendCVEs(cves []fetcher.CVE) {
-	categorized := make(map[string][]fetcher.CVE)
-	for _, cve := range cves {
-		t := filter.CVEType(cve.Description)
-		categorized[t] = append(categorized[t], cve)
-	}
-
-	for cveType, list := range categorized {
-		channelID, ok := n.Channels[cveType]
-		if !ok {
-			fmt.Printf("No channel mapped for type %s, skipping...\n", cveType)
-			continue
+func (n *DiscordNotifier) SendCVEs(cves []filter.CveInfo) {
+	for i := 0; i < len(cves); i += batchSize {
+		end := i + batchSize
+		if end > len(cves) {
+			end = len(cves)
 		}
 
-		for _, cve := range list {
-			_, err := n.Session.ChannelMessageSendEmbed(channelID, &discordgo.MessageEmbed{
-				Title:       cve.ID,
-				URL:         cve.URL,
-				Description: cve.Description,
-				Color:       16711680,
-			})
-			if err != nil {
-				fmt.Printf("Error sending CVE %s: %v\n", cve.ID, err)
-			}
-			time.Sleep(n.Delay)
+		batch := cves[i:end]
+		for _, cve := range batch {
+			_ = n.SendCVE(cve)
+		}
+
+		if end < len(cves) {
+			log.Printf("⏳ Waiting %s before sending next batch...", batchDelay)
+			time.Sleep(batchDelay)
 		}
 	}
+}
+
+// Start opens the Discord session (required for bots)
+func (n *DiscordNotifier) Start() error {
+	return n.Session.Open()
+}
+
+// Stop closes the Discord session
+func (n *DiscordNotifier) Stop() {
+	_ = n.Session.Close()
 }
